@@ -17,7 +17,7 @@ use crate::{
     btf::{
         info::{FuncSecInfo, LineSecInfo},
         relocation::Relocation,
-        Array, BtfEnum, BtfKind, BtfMember, BtfType, Const, Enum, FuncInfo, FuncLinkage, Int,
+        Array, BtfEnum, BtfKind, BtfMember, BtfRebaseInfo, BtfType, Const, Enum, FuncInfo, FuncLinkage, Int,
         IntEncoding, LineInfo, Struct, Typedef, Union, VarLinkage,
     },
     generated::{btf_ext_header, btf_header},
@@ -271,6 +271,29 @@ impl Btf {
         }
     }
 
+    /// Merges a base BTF and multiple split BTFs into a single BTF.
+    pub fn merge_split_btfs(base_btf: &Btf, split_btfs: &[Btf]) -> Btf {
+        // Create a Btf from all the btfs.
+        let mut out_btf = base_btf.clone();
+
+        let mut rebase_info = BtfRebaseInfo {
+            str_relocate_from: out_btf.strings.len() as u32,
+            types_relocate_from: out_btf.types.types.len() as u32,
+            str_new_offset: out_btf.strings.len() as u32,
+            types_new_offset: out_btf.types.types.len() as u32,
+        };
+        for btf in split_btfs {
+            rebase_info.str_new_offset = out_btf.strings.len() as u32;
+            rebase_info.types_new_offset = out_btf.types.types.len() as u32;
+            out_btf.strings.extend(&btf.strings);
+            for ty in &btf.types.types {
+                out_btf.types.types.push(ty.relocate(&rebase_info));
+            }
+        }
+
+        out_btf
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         // the first one is awlays BtfType::Unknown
         self.types.types.len() < 2
@@ -299,10 +322,28 @@ impl Btf {
         type_id as u32
     }
 
-    /// Loads BTF metadata from `/sys/kernel/btf/vmlinux`.
+    /// Loads BTF metadata from `/sys/kernel/btf`.
     #[cfg(feature = "std")]
     pub fn from_sys_fs() -> Result<Btf, BtfError> {
-        Btf::parse_file("/sys/kernel/btf/vmlinux", Endianness::default())
+        let base_btf = Btf::parse_file("/sys/kernel/btf/vmlinux", Endianness::default())?;
+        let mut split_btfs = vec![];
+        let dir_iter = std::fs::read_dir("/sys/kernel/btf")
+            .map_err(|error| BtfError::FileError {
+                path: "/sys/kernel/btf".into(),
+                error,
+            })?
+            .filter_map(|v| v.ok())
+            .filter(|v| v.file_name() == "vmlinux");
+        for entry in dir_iter {
+            match entry.file_type() {
+                Ok(v) if !v.is_file() => continue,
+                Err(_err) => continue,
+                Ok(_v) => (),
+            }
+            split_btfs.push(Btf::parse_file(entry.path(), Endianness::default())?);
+        }
+
+        Ok(Self::merge_split_btfs(&base_btf, &split_btfs))
     }
 
     /// Loads BTF metadata from the given `path`.
